@@ -1,2 +1,2 @@
 def twoSum(nums, target):
-    while (true){}
+    print(10)

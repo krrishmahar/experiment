@@ -1,7 +1,6 @@
 import express from 'express';
 import cors from 'cors';
 import bodyParser from 'body-parser';
-import { Daytona } from '@daytonaio/sdk';
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
@@ -10,7 +9,7 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 const app = express();
-const PORT = 3002;
+const PORT = 3001;
 
 app.use(cors());
 app.use(bodyParser.json());
@@ -20,11 +19,6 @@ const uploadDir = path.join(__dirname, 'uploads');
 if (!fs.existsSync(uploadDir)) {
     fs.mkdirSync(uploadDir);
 }
-
-// Daytona Client Initialization
-const daytona = new Daytona({
-    apiKey: process.env.TEST_BOX || 'dtn_fd9df76fc1d41a955730711016f3e18aaea19a9780a2646eed94d954ac2fcf8d'
-});
 
 // Problem Registry
 const PROBLEMS: any = {
@@ -50,17 +44,18 @@ const PROBLEMS: any = {
     }
 };
 
+const JUDGE0_LANG_IDS: any = {
+    'javascript': 63,
+    'typescript': 74, // TypeScript (3.7.4)
+    'python': 71, // Python (3.8.1)
+    'java': 62, // Java (OpenJDK 13.0.1)
+    'cpp': 54, // C++ (GCC 9.2.0)
+    'c': 50 // C (GCC 9.2.0)
+};
+
 function validateCode(code: string, language: string): boolean {
-    if (!code || code.trim().length < 10) return false;
-    const keywords: any = {
-        'javascript': ['function', 'return'],
-        'typescript': ['function', 'return'],
-        'python': ['def', 'return'],
-        'java': ['class', 'public', 'static'],
-        'cpp': ['class', 'public', 'vector']
-    };
-    const langKeywords = keywords[language] || [];
-    return langKeywords.some((k: string) => code.includes(k)) || code.length > 50;
+    if (!code || code.trim().length < 1) return false;
+    return true; // Simplified validation
 }
 
 function wrapCode(code: string, language: string, problem: any): string {
@@ -69,7 +64,6 @@ function wrapCode(code: string, language: string, problem: any): string {
 
     switch (language) {
         case 'javascript':
-        case 'typescript':
             return `${code}
             
             // Test Runner
@@ -80,13 +74,33 @@ function wrapCode(code: string, language: string, problem: any): string {
                 try {
                     const result = ${functionName}(tc.nums, tc.target);
                     console.log(\`Test Case \${index + 1}: \${JSON.stringify(result)}\`);
-                } catch (e: any) {
+                } catch (e) {
                      console.log(\`Test Case \${index + 1}: Error - \${e.message}\`);
                 }
             });
             const endTime = performance.now();
             console.log(\`METRICS: TIME=\${(endTime - startTime).toFixed(4)}ms\`);
             `;
+        case 'typescript':
+            // Judge0 might run TS directly or compile. ID 74 is TS.
+            // It usually expects a single file. 
+            return `${code}
+           
+           // Test Runner
+           const testCases = ${testCasesJSON};
+           
+           const startTime = performance.now();
+           testCases.forEach((tc: any, index: number) => {
+               try {
+                   const result = ${functionName}(tc.nums, tc.target);
+                   console.log(\`Test Case \${index + 1}: \${JSON.stringify(result)}\`);
+               } catch (e: any) {
+                    console.log(\`Test Case \${index + 1}: Error - \${e.message}\`);
+               }
+           });
+           const endTime = performance.now();
+           console.log(\`METRICS: TIME=\${(endTime - startTime).toFixed(4)}ms\`);
+           `;
         case 'python':
             return `${code}
 import json
@@ -106,12 +120,19 @@ end_time = time.time()
 print(f"METRICS: TIME={(end_time - start_time) * 1000}ms")
 `;
         case 'java':
-            // For Java, wrapCode now only generates the Main class (Runner)
-            // The user code will be in Solution.java
+            // Merge classes. Remove 'public' from Solution class.
+            // Ensure Main is the only public class? Judge0 often runs the class named Main or based on filename.
+            // We'll create a class structure where Solution is a static inner class or separate non-public class.
+            // Simplest: separate class, but remove 'public'.
+            const sanitizedCode = code.replace(/public\s+class\s+Solution/, 'class Solution');
             return `
 import java.util.Arrays;
 import java.util.List;
 import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.Map;
+
+${sanitizedCode}
 
 public class Main {
     public static void main(String[] args) {
@@ -144,6 +165,8 @@ public class Main {
 }
 `;
         case 'cpp':
+        case 'c':
+            // C++ also needs basic structure. 
             return `
 #include <iostream>
 #include <vector>
@@ -201,103 +224,91 @@ int main() {
     }
 }
 
-const EXECUTION_TIMEOUT_MS = 10000; // 10 seconds
-
 app.post('/api/execute', async (req, res) => {
     const { code, language, problemId } = req.body;
+    console.log(`[EXECUTE] Request received for ${problemId} in ${language}`);
+
     const problem = PROBLEMS[problemId || 'two-sum'];
 
-    // 1. Validation
     if (!validateCode(code, language)) {
-        return res.status(400).json({ status: 'Invalid', output: 'Code validation failed. Please provide valid code logic.' });
+        return res.status(400).json({ status: 'Invalid', output: 'Code validation failed.', results: [] });
     }
 
-    const submissionId = Date.now().toString();
-    const fileName = `submission_${submissionId}.${language === 'python' ? 'py' : language === 'java' ? 'java' : language === 'cpp' ? 'cpp' : language === 'javascript' ? 'js' : 'ts'}`;
-    const filePath = path.join(uploadDir, fileName);
+    // Save Submission
+    const submissionId = Date.now();
+    const ext = language === 'python' ? 'py' : language === 'java' ? 'java' : language === 'cpp' ? 'cpp' : language === 'javascript' ? 'js' : 'ts';
+    const filename = `submission_${submissionId}.${ext}`;
+    fs.writeFileSync(path.join(uploadDir, filename), code);
+    console.log(`[EXECUTE] Saved submission to ${filename}`);
 
-    // Save original code
-    fs.writeFileSync(filePath, code);
+    const wrappedCode = wrapCode(code, language, problem);
+    const judge0Id = JUDGE0_LANG_IDS[language];
 
-    let sandbox;
+    if (!judge0Id) {
+        return res.status(400).json({ status: 'Error', output: 'Unsupported Language', results: [] });
+    }
+
     try {
-        // 2. Daytona Integration
-        console.log(`Creating Sandbox for ${language}...`);
-        sandbox = await daytona.create({
-            language: language === 'java' ? 'java' : language === 'cpp' ? 'cpp' : language === 'python' ? 'python' : 'typescript',
+        const payload = {
+            source_code: Buffer.from(wrappedCode).toString('base64'),
+            language_id: judge0Id,
+            stdin: Buffer.from("").toString('base64')
+        };
+
+        console.log(`[JUDGE0] Sending to localhost:2358... LangID: ${judge0Id}`);
+        console.log(`[JUDGE0] Payload:`, JSON.stringify(payload));
+
+        // Send to Judge0
+        const response = await fetch('http://localhost:2358/submissions?base64_encoded=true&wait=true', {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json'
+            },
+            body: JSON.stringify(payload)
         });
-        console.log(`Sandbox created: ${sandbox.id}`);
 
-        let resultObj = { result: '', exitCode: 0, error: '' };
-
-        // Timeout Promise
-        const timeoutPromise = new Promise((_, reject) =>
-            setTimeout(() => reject(new Error('Time Limit Exceeded')), EXECUTION_TIMEOUT_MS)
-        );
-
-        // Execution Logic
-        const executionPromise = (async () => {
-            // 3. Wrap & Run Code
-            if (language === 'typescript' || language === 'javascript') {
-                const wrappedCode = wrapCode(code, language, problem);
-                const response = await sandbox.process.codeRun(wrappedCode);
-                return { result: response.result, exitCode: response.exitCode, error: '' };
-
-            } else if (language === 'python') {
-                const wrappedCode = wrapCode(code, language, problem);
-                const response = await sandbox.process.codeRun(wrappedCode);
-                return { result: response.result, exitCode: response.exitCode, error: '' };
-
-            } else if (language === 'java') {
-                // Write Solution.java
-                await sandbox.fs.uploadFile(Buffer.from(code), '/home/daytona/Solution.java');
-
-                // Write Main.java (Runner)
-                const runnerCode = wrapCode('', language, problem);
-                await sandbox.fs.uploadFile(Buffer.from(runnerCode), '/home/daytona/Main.java');
-
-                const compile = await sandbox.process.executeCommand('javac /home/daytona/Solution.java /home/daytona/Main.java');
-                if (compile.exitCode !== 0) {
-                    return { result: compile.result, exitCode: compile.exitCode, error: 'Compilation Error' };
-                } else {
-                    const run = await sandbox.process.executeCommand('java -cp /home/daytona Main');
-                    return { result: run.result, exitCode: run.exitCode, error: '' };
-                }
-
-            } else if (language === 'cpp') {
-                const wrappedCode = wrapCode(code, language, problem);
-                await sandbox.fs.uploadFile(Buffer.from(wrappedCode), '/home/daytona/solution.cpp');
-                const compile = await sandbox.process.executeCommand('g++ /home/daytona/solution.cpp -o /home/daytona/solution');
-                if (compile.exitCode !== 0) {
-                    return { result: compile.result, exitCode: compile.exitCode, error: 'Compilation Error' };
-                } else {
-                    const run = await sandbox.process.executeCommand('/home/daytona/solution');
-                    return { result: run.result, exitCode: run.exitCode, error: '' };
-                }
-            }
-            return { result: 'Unknown Language', exitCode: 1, error: '' };
-        })();
-
-        // Race Timeout vs Execution
-        try {
-            resultObj = await Promise.race([executionPromise, timeoutPromise]) as any;
-        } catch (e: any) {
-            resultObj = { result: 'Time Limit Exceeded', exitCode: 124, error: e.message };
+        if (!response.ok) {
+            throw new Error(`Judge0 responded with status: ${response.status} ${response.statusText}`);
         }
 
-        // 4. Parse Results & Metrics
-        const outputString = resultObj.result || "";
+        const data: any = await response.json();
+        console.log(`[JUDGE0] Response received. Status ID: ${data.status?.id} (${data.status?.description})`);
+
+        // Check if Judge0 accepted it
+        if (!data.stdout && data.stderr) {
+            // Compilation or Runtime Error
+            // Decode stderr
+            const stderr = Buffer.from(data.stderr, 'base64').toString('utf-8');
+            console.log(`[JUDGE0] Stderr: ${stderr}`);
+            return res.json({
+                status: 'Runtime Error',
+                output: stderr,
+                results: [],
+                metrics: { time: 0 }
+            });
+        }
+
+        if (data.status.id === 6) { // Compilation Error in Judge0
+            const compileOutput = Buffer.from(data.compile_output || "", 'base64').toString('utf-8');
+            console.log(`[JUDGE0] Compilation Error: ${compileOutput}`);
+            return res.json({
+                status: 'Compilation Error',
+                output: compileOutput,
+                results: [],
+                metrics: { time: 0 }
+            });
+        }
+
+        // Success (hopefully)
+        const outputString = data.stdout ? Buffer.from(data.stdout, 'base64').toString('utf-8') : "";
+        console.log(`[JUDGE0] Stdout: ${outputString.substring(0, 100)}...`);
 
         // Extract Time Metric
         const timeMatch = outputString.match(/METRICS: TIME=([\d.]+)ms/);
-        const runTime = timeMatch ? parseFloat(timeMatch[1]) : (resultObj.exitCode === 124 ? 10000 : 0);
+        const runTime = timeMatch ? parseFloat(timeMatch[1]) : (parseFloat(data.time) * 1000 || 0);
 
-        // Parse Cases
+        // Parse Results
         const finalResults = problem.testCases.map((tc: any, index: number) => {
-            if (resultObj.exitCode !== 0 && resultObj.error === 'Time Limit Exceeded') {
-                return { ...tc, actual: "Timeout", status: "Time Limit Exceeded" };
-            }
-
             const searchStr = `Test Case ${index + 1}: `;
             const line = outputString.split('\n').find((l: string) => l.includes(searchStr));
             if (!line) return { ...tc, actual: "No Output", status: "Runtime Error" };
@@ -323,16 +334,6 @@ app.post('/api/execute', async (req, res) => {
             };
         });
 
-        if (resultObj.exitCode !== 0) {
-            const isTLE = resultObj.error === 'Time Limit Exceeded';
-            return res.json({
-                status: isTLE ? 'Time Limit Exceeded' : 'Runtime Error',
-                output: resultObj.result + (resultObj.error && !isTLE ? '\n' + resultObj.error : ''),
-                results: finalResults,
-                metrics: { time: isTLE ? 10000 : 0 }
-            });
-        }
-
         res.json({
             status: finalResults.every((r: any) => r.status === 'Accepted') ? 'Accepted' : 'Wrong Answer',
             output: outputString.replace(/METRICS:.*\n?/, ''),
@@ -343,17 +344,12 @@ app.post('/api/execute', async (req, res) => {
         });
 
     } catch (error: any) {
-        console.error("Sandbox error:", error);
-        res.json({ status: 'Error', output: error.message, results: [] });
-    } finally {
-        if (sandbox) {
-            console.log("Deleting sandbox...");
-            await daytona.delete(sandbox);
-        }
+        console.error("Judge0 Error:", error);
+        res.status(500).json({ status: 'Error', output: `Judge0 Connection Failed: ${error.message}. Is Judge0 running on port 2358?`, results: [] });
     }
 });
 
 app.listen(PORT, () => {
     console.log(`Server running on http://localhost:${PORT}`);
-    console.log(`Daytona SDK dependency loaded.`);
+    console.log(`Using Judge0 at http://localhost:2358`);
 });
